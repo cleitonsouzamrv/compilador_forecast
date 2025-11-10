@@ -1,0 +1,220 @@
+# marco_parede.py
+import io
+import re
+import unicodedata
+from typing import Dict, List
+import pandas as pd
+import streamlit as st
+
+
+MAX_FILES = 300
+EXCEL_SHEETNAME_MAX = 31
+
+TARGET_COLS = [
+    "Arquivo",
+    "NET",
+    "Nome",
+    "Duração",
+    "Início",
+    "Término",
+    "Obra",
+    "IdEmpreendimento",
+    "SimulacaoId",
+    "Duração obra (meses)",
+    "Início PC Obra",
+    "Término PC Obra",
+]
+
+def _strip_accents_upper(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza nomes de colunas comuns e garante consistência."""
+    if df is None or df.empty:
+        return df
+
+    canon_map = {
+        "NET": "NET",
+        "NOME": "Nome",
+        "DURACAO": "Duração",
+        "INICIO": "Início",
+        "INÍCIO": "Início",
+        "TERMINO": "Término",
+        "TÉRMINO": "Término",
+        "CUSTO OBRA": "Custo Obra",
+        "OBRA": "Obra",
+        "NOME OBRA": "Obra",
+        "IDEMPREENDIMENTO": "IdEmpreendimento",
+        "SIMULACAOID": "SimulacaoId",
+    }
+
+    rename_dict = {}
+    for c in df.columns:
+        key = _strip_accents_upper(c)
+        if key in canon_map:
+            rename_dict[c] = canon_map[key]
+
+    return df.rename(columns=rename_dict)
+
+
+def _add_periodo_construcao(df: pd.DataFrame) -> pd.DataFrame:
+    """Adiciona as colunas Início/Término PC Obra considerando todas as linhas com 'Alvenaria / Parede de Concreto'."""
+    if df is None or df.empty or "Obra" not in df.columns or "Nome" not in df.columns:
+        df["Início PC Obra"] = pd.NaT
+        df["Término PC Obra"] = pd.NaT
+        return df
+
+    df = df.copy()
+
+    # Normaliza nome da obra (sem acentos e maiúsculo)
+    df["Obra_norm"] = (
+        df["Obra"]
+        .astype(str)
+        .apply(lambda x: unicodedata.normalize("NFKD", x).encode("ASCII", "ignore").decode("ASCII").upper())
+    )
+
+    # Converte datas
+    for col in ["Início", "Término"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Cria um dataframe auxiliar apenas com as linhas da parede de concreto
+    df_parede = df[df["Nome"].astype(str).str.contains("ALVENARIA / PAREDE DE CONCRETO", case=False, na=False)]
+
+    # Calcula menor e maior data por obra
+    df_pc = (
+        df_parede.groupby("Obra_norm", dropna=False)[["Início", "Término"]]
+        .agg({"Início": "min", "Término": "max"})
+        .reset_index()
+        .rename(columns={"Início": "Início PC Obra", "Término": "Término PC Obra"})
+    )
+
+    # Junta no dataframe original
+    df = df.merge(df_pc, on="Obra_norm", how="left")
+
+    df = df.drop(columns=["Obra_norm"], errors="ignore")
+    return df
+
+
+def _ensure_and_reorder(df: pd.DataFrame, arquivo_name: str) -> pd.DataFrame:
+    """Garante colunas obrigatórias, remove custo e adiciona datas agregadas."""
+    if df is None or df.empty:
+        base = pd.DataFrame(columns=TARGET_COLS)
+        base["Arquivo"] = arquivo_name
+        return base
+
+    df = _normalize_columns(df).copy()
+    df["Arquivo"] = arquivo_name
+    df = df.drop(columns=["Custo Obra"], errors="ignore")
+
+    # Adiciona colunas de início/término PC Obra
+    df = _add_periodo_construcao(df)
+
+    for col in TARGET_COLS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    return df[TARGET_COLS]
+
+
+def ler_todas_linhas_excels(files: List) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """Lê todas as abas de todos os arquivos Excel enviados."""
+    todos = {}
+    for up in files[:MAX_FILES]:
+        try:
+            xls = pd.read_excel(up, sheet_name=None)
+        except Exception as e:
+            st.warning(f"Falha ao ler '{up.name}': {e}")
+            continue
+
+        tabelas = {
+            sheet: (df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+            for sheet, df in xls.items()
+        }
+        todos[up.name] = tabelas
+    return todos
+
+
+def compilar_parede(tabelas: Dict[str, Dict[str, pd.DataFrame]]) -> pd.DataFrame:
+    """Empilha linhas de todas as guias contendo 'Alvenaria / Parede de Concreto'."""
+    frames = []
+    for arquivo, guias in tabelas.items():
+        for _, df in guias.items():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            df = _ensure_and_reorder(df, arquivo)
+
+            # Filtra apenas linhas com o texto alvo
+            filtro = df["Nome"].astype(str).str.contains("ALVENARIA / PAREDE DE CONCRETO", case=False, na=False)
+            df_filtrado = df[filtro]
+            if not df_filtrado.empty:
+                frames.append(df_filtrado)
+
+    if not frames:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    emp = pd.concat(frames, ignore_index=True, sort=False)
+    return emp[TARGET_COLS]
+
+
+def gerar_excel_parede(tabelas: Dict[str, Dict[str, pd.DataFrame]]) -> bytes:
+    """Gera o Excel final com as linhas de parede e datas agregadas corretas."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        emp = compilar_parede(tabelas)
+        emp.to_excel(writer, index=False, sheet_name="Parede_compilado")
+    buffer.seek(0)
+    return buffer.read()
+
+def render_tab():
+    st.markdown(
+        """
+### Compilar Cronogramas — Alvenaria / Parede de Concreto
+
+- Lê **todas as guias** dos arquivos .xlsx carregados  
+- Mantém as colunas originais de **Início/Término**  
+- Adiciona:
+  - **Início PC Obra:** menor data da parede de concreto na obra  
+  - **Término PC Obra:** maior data da parede de concreto na obra  
+"""
+    )
+
+    uploaded_files = st.file_uploader(
+        "Selecione um ou mais arquivos Excel (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded_files:
+        st.info("Aguardando arquivos .xlsx...")
+        return
+
+    col1, col2 = st.columns([1, 1])
+    gerar_clicked = col1.button("Gerar Excel (Parede de Concreto)", type="primary")
+    preview_clicked = col2.button("Pré-visualizar (linhas filtradas)")
+
+    if gerar_clicked:
+        with st.spinner("Lendo e processando arquivos..."):
+            tabelas = ler_todas_linhas_excels(uploaded_files)
+            xlsx_bytes = gerar_excel_parede(tabelas)
+
+        st.success("Arquivo pronto para download.")
+        st.download_button(
+            "Baixar Excel (Cronogramas - Parede).xlsx",
+            data=xlsx_bytes,
+            file_name="Cronogramas_Parede.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if preview_clicked:
+        with st.spinner("Gerando pré-visualização..."):
+            tabelas = ler_todas_linhas_excels(uploaded_files)
+            emp = compilar_parede(tabelas)
+            st.dataframe(emp.head(100), use_container_width=True)
