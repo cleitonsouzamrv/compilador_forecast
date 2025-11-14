@@ -1,3 +1,4 @@
+# marco_modulo.py
 import io
 import re
 import time
@@ -54,12 +55,15 @@ def _calculate_work_duration(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "Obra" not in df.columns:
         df["Duração obra (meses)"] = None
         return df
+
     inicio = _convert_excel_dates(df.get("Início", pd.Series([pd.NaT] * len(df))))
     termino = _convert_excel_dates(df.get("Término", pd.Series([pd.NaT] * len(df))))
+
     duracoes = {}
     for obra, subset in df.groupby("Obra"):
         fundacao = inicio[subset["Nome"].str.contains("Fundação", case=False, na=False)].min()
         fim_fisico = termino[subset["Nome"].str.contains("Fim Físico", case=False, na=False)].max()
+
         if pd.notna(fundacao) and pd.notna(fim_fisico):
             diff_meses = (fim_fisico.year - fundacao.year) * 12 + (fim_fisico.month - fundacao.month)
             if fim_fisico.day < fundacao.day:
@@ -67,6 +71,7 @@ def _calculate_work_duration(df: pd.DataFrame) -> pd.DataFrame:
             duracoes[obra] = max(diff_meses, 0)
         else:
             duracoes[obra] = None
+
     df["Duração obra (meses)"] = df["Obra"].map(duracoes)
     return df
 
@@ -104,16 +109,18 @@ def _process_single_file(arquivo) -> pd.DataFrame:
         st.warning(f"Erro em {arquivo.name}: {e}")
         return pd.DataFrame(columns=COLUNAS)
 
+
 # ==========================
 # Funções principais
 # ==========================
 def processar_arquivos(uploaded_files: List):
     """Processa e mostra tempo de cada etapa"""
+
     total = len(uploaded_files[:MAX_FILES])
 
-    # ---------------------
-    # Etapa 1 - Carregamento
-    # ---------------------
+    # -------------------------------------------------
+    # ETA 1 — CARREGAMENTO
+    # -------------------------------------------------
     st.info("⏳ Etapa 1: Carregando arquivos Excel...")
     load_bar = st.progress(0, text="Carregando arquivos...")
     start_load = time.time()
@@ -123,18 +130,19 @@ def processar_arquivos(uploaded_files: List):
     for i, arq in enumerate(arquivos):
         excel_objects.append(arq)
         load_bar.progress((i + 1) / total, text=f"Lendo arquivo {i+1}/{total}")
+
     load_time = time.time() - start_load
     load_bar.empty()
-    st.success(f"✅ {total} arquivos carregados em {load_time:.2f} segundos.")
+    st.success(f"📥 {total} arquivos carregados em **{load_time:.2f} segundos**.")
 
-    # ---------------------
-    # Etapa 2 - Processamento
-    # ---------------------
+    # -------------------------------------------------
+    # ETA 2 — PROCESSAMENTO
+    # -------------------------------------------------
     st.info("⚙️ Etapa 2: Processando dados...")
     process_bar = st.progress(0, text="Processando arquivos...")
     start_proc = time.time()
-    resultados = []
 
+    resultados = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_process_single_file, arq): arq for arq in excel_objects}
         for i, future in enumerate(as_completed(futures)):
@@ -145,32 +153,44 @@ def processar_arquivos(uploaded_files: List):
     process_time = time.time() - start_proc
     process_bar.empty()
 
+    # Junta tudo
     df_final = pd.concat(resultados, ignore_index=True) if resultados else pd.DataFrame(columns=COLUNAS)
     df_final = df_final[df_final["Módulo"] != ""]
 
     total_time = load_time + process_time
+
     st.success(
-        f"🏁 Processamento finalizado: "
-        f"{len(df_final)} linhas consolidadas em {total_time:.1f}s "
+        f"🏁 Processamento concluído em **{total_time:.1f}s** "
         f"(Leitura: {load_time:.1f}s | Processamento: {process_time:.1f}s)"
     )
 
     return df_final
 
 
+# -------------------------------------------------
+# ETA 3 — EXPORTAÇÃO (com temporizador)
+# -------------------------------------------------
 def gerar_excel(df):
+    start_export = time.time()
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="DadosConsolidados")
+
+    export_time = time.time() - start_export
+    st.info(f"📤 Planilha de output gerada em **{export_time:.2f} segundos**.")
+
     return buf.getvalue()
 
 
+# -------------------------------------------------
+# Renderização da página
+# -------------------------------------------------
 def render_tab():
     st.header("📊 Compilar Cronogramas — Marco por Módulos")
     st.write("""
-    **Arquivos para upload: Cronogramas (xlsx)**
-    
-    Os arquivos poderão ser compilados ou individuais.
+    **Arquivos para upload: Cronogramas (xlsx)**  
+    Os arquivos podem ser individuais ou compilados.
     """)
 
     arquivos = st.file_uploader(
@@ -183,13 +203,14 @@ def render_tab():
         st.info("Aguardando upload de arquivos...")
         return
 
-    st.info(f"{len(arquivos)} arquivo(s) carregado(s). Máximo: {MAX_FILES}")
+    st.info(f"{len(arquivos)} arquivo(s) carregado(s). Máximo permitido: {MAX_FILES}")
 
-    if st.button("🚀 Iniciar Consolidação", use_container_width=True, type="primary"):
+    if st.button("🚀 Iniciar Consolidação", type="primary", use_container_width=True):
+
         dados = processar_arquivos(arquivos)
 
         if dados.empty:
-            st.error("Nenhum dado válido encontrado com Módulo M01–M15.")
+            st.error("Nenhum dado válido encontrado com módulos M01–M15.")
             return
 
         st.subheader("✅ Prévia dos Dados Consolidados")
